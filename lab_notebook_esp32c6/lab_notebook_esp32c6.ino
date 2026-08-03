@@ -59,11 +59,12 @@
  *
  * STATUS LED (XIAO ESP32C6 "USER LED", GPIO15, active-LOW on most XIAO
  * boards -- verify polarity on your unit and flip LED_ACTIVE_LOW if the
- * blink looks inverted). Reflects LittleFS usage:
- *   <=20% full   : blink @ 0.5 Hz
- *   20-50% full  : blink @ 1 Hz
- *   50-80% full  : blink @ 2 Hz
- *   80-100% full : solid on
+ * blink looks inverted). Reflects the sync queue (total pending sample
+ * files across ALL experiments, not just the active one) and storage use:
+ *   queue empty                   : off
+ *   queue non-empty, 0-5% full    : blink @ 1 Hz
+ *   queue non-empty, 5-80% full   : blink @ 5 Hz
+ *   queue non-empty, 80-95% full  : solid on
  */
 
 #include <Arduino.h>
@@ -75,6 +76,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "Seeed_Arduino_mmWave.h"
+#include <map>
 
 #ifdef ESP32
 #include <HardwareSerial.h>
@@ -93,7 +95,7 @@ SEEED_MR60BHA2 mmWave;
 
 #define SAMPLE_INTERVAL_MS   1000UL
 #define HEARTBEAT_INTERVAL_MS 2000UL
-#define SYNC_BATCH_MAX         20    // max rows sent per single SYNCREQ
+#define SYNC_BATCH_MAX         50    // max rows sent per single SYNCREQ
 #define BLE_NOTIFY_GAP_MS     15     // spacing between back-to-back notifications
 #define STORAGE_PAUSE_PCT     95     // stop sampling above this usage to protect flash
 
@@ -131,6 +133,21 @@ unsigned long lastHeartbeatAt = 0;
 // Storage-based LED blink state
 unsigned long lastLedToggleAt = 0;
 bool ledOn = false;
+
+// Total pending sample files per experiment, kept in memory and updated
+// incrementally (++ on capture, -- on delete) instead of re-scanning the
+// filesystem constantly. A full LittleFS directory scan over hundreds of
+// small files takes many seconds -- doing that every 2s heartbeat was
+// starving other tasks badly enough to trip the watchdog and reboot the
+// chip. Rebuilt once at boot via rebuildPendingCountsFromFS(); after
+// that, the filesystem is never re-scanned just to count things.
+std::map<String, uint32_t> pendingCountByExp;
+
+// Cheap cached sum of pendingCountByExp, refreshed lightly (see loop())
+// rather than summed fresh on every single loop() iteration.
+uint32_t totalPendingGlobal = 0;
+unsigned long lastPendingScanAt = 0;
+#define PENDING_SCAN_INTERVAL_MS 500UL
 
 // LittleFS is touched from two different FreeRTOS tasks -- the Arduino
 // main loop (sampling, once/sec) and the BLE command callback (LISTEXP/
@@ -284,6 +301,7 @@ void captureSample() {
   f.close();
 
   nextIndex++;
+  pendingCountByExp[currentExpId]++;
   saveState(); // small file, cheap enough to persist every sample for reboot-safety
   fsUnlock();
 
@@ -321,28 +339,51 @@ void handleStop() {
   Serial.printf("Experiment stopped: %s\n", currentExpId.c_str());
 }
 
-void handleListExp() {
+// One-time (boot-only) rebuild of pendingCountByExp from the filesystem.
+// This is the only place a full per-experiment countPending() scan still
+// happens -- acceptable because it runs once at startup, not repeatedly.
+void rebuildPendingCountsFromFS() {
   fsLock();
-  String result = "";
+  pendingCountByExp.clear();
   File root = LittleFS.open("/");
   File entry = root.openNextFile();
-  bool first = true;
   while (entry) {
     if (entry.isDirectory()) {
       String name = String(entry.name());
-      // LittleFS core versions differ on whether directory entries come
-      // back with a leading slash ("/exp_...") or bare ("exp_..."row).
-      // Normalize to bare so it matches expDir()'s "/" + expId convention.
       if (name.startsWith("/")) name = name.substring(1);
-      uint32_t pending = countPending(name);
-      Serial.printf("LISTEXP: found dir '%s' pending=%lu\n", name.c_str(), (unsigned long)pending);
-      if (pending > 0) {
-        if (!first) result += ",";
-        result += name;
-        first = false;
+      uint32_t count = countPending(name);
+      if (count > 0) {
+        pendingCountByExp[name] = count;
+      } else {
+        // Empty leftover folder from a prior run -- clean it up.
+        LittleFS.rmdir(expDir(name));
       }
+      Serial.printf("Boot scan: '%s' pending=%lu\n", name.c_str(), (unsigned long)count);
     }
     entry = root.openNextFile();
+  }
+  fsUnlock();
+}
+
+// Cheap in-memory sum across all tracked experiments (no filesystem access).
+uint32_t sumAllPending() {
+  fsLock();
+  uint32_t total = 0;
+  for (auto const &kv : pendingCountByExp) total += kv.second;
+  fsUnlock();
+  return total;
+}
+
+void handleListExp() {
+  fsLock();
+  String result = "";
+  bool first = true;
+  for (auto const &kv : pendingCountByExp) {
+    if (kv.second > 0) {
+      if (!first) result += ",";
+      result += kv.first;
+      first = false;
+    }
   }
   fsUnlock();
   Serial.println("LISTEXP result: [" + result + "]");
@@ -362,10 +403,11 @@ void handleSyncReq(const String &expId) {
     return;
   }
 
-  // Snapshot the pending count up front, before the scan, so a sample
-  // written mid-scan (blocked by the mutex until we're done anyway,
-  // but conceptually) doesn't skew what "remaining" means for this pass.
-  uint32_t totalPending = countPending(expId);
+  // Snapshot the pending count up front, from the in-memory map (no
+  // filesystem scan) rather than counting files, which doesn't scale
+  // once backlog reaches the hundreds.
+  auto pendIt = pendingCountByExp.find(expId);
+  uint32_t totalPending = (pendIt != pendingCountByExp.end()) ? pendIt->second : 0;
 
   File dir = LittleFS.open(dirPath);
   File entry = dir.openNextFile();
@@ -436,6 +478,14 @@ void handleDelete(const String &rest) {
   fsLock();
   if (LittleFS.exists(path)) {
     LittleFS.remove(path);
+    auto it = pendingCountByExp.find(expId);
+    if (it != pendingCountByExp.end()) {
+      if (it->second > 0) it->second--;
+      if (it->second == 0) {
+        pendingCountByExp.erase(it);
+        LittleFS.rmdir(expDir(expId)); // safe no-op if not actually empty
+      }
+    }
   }
   fsUnlock();
   notifyLine("ACK:DEL:" + expId + ":" + idxStr);
@@ -506,6 +556,7 @@ void setup() {
     Serial.println("ERROR: LittleFS mount failed");
   }
   loadState();
+  rebuildPendingCountsFromFS();
 
   mmWaveSerial.begin(115200);
   mmWave.begin(&mmWaveSerial);
@@ -561,28 +612,48 @@ void loop() {
   // Heartbeat status report
   if (deviceConnected && (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS)) {
     lastHeartbeatAt = now;
-    uint32_t pending = expActive ? countPending(currentExpId) : 0;
+    fsLock();
+    auto it = pendingCountByExp.find(currentExpId);
+    uint32_t pending = (expActive && it != pendingCountByExp.end()) ? it->second : 0;
+    fsUnlock();
     String line = "S:" + String(expActive ? 1 : 0) + ":" + currentExpId + ":" +
                   String(pending) + ":" + String(storagePct(), 1);
     notifyLine(line);
   }
 
-  // Storage-usage LED
-  float pct = storagePct();
-  unsigned long blinkPeriodMs;
-  bool solid = false;
-  if (pct >= 80.0f) {
-    solid = true;
-    blinkPeriodMs = 0;
-  } else if (pct >= 50.0f) {
-    blinkPeriodMs = 250;  // 2 Hz -> full cycle 500ms -> toggle every 250ms
-  } else if (pct >= 20.0f) {
-    blinkPeriodMs = 500;  // 1 Hz -> toggle every 500ms
-  } else {
-    blinkPeriodMs = 1000; // 0.5 Hz -> toggle every 1000ms
+  // Total pending queue size, refreshed from the in-memory map (no
+  // filesystem access -- cheap enough to do this often).
+  if (now - lastPendingScanAt >= PENDING_SCAN_INTERVAL_MS) {
+    lastPendingScanAt = now;
+    totalPendingGlobal = sumAllPending();
   }
 
-  if (solid) {
+  // Status LED: off when nothing is waiting to be synced; otherwise
+  // blink rate/solid reflects how full storage is getting.
+  //   queue empty                  : off
+  //   queue non-empty, 0-5% full   : blink @ 1 Hz
+  //   queue non-empty, 5-80% full  : blink @ 5 Hz
+  //   queue non-empty, 80-95% full : solid
+  float pct = storagePct();
+  bool ledOff = false;
+  bool solid = false;
+  unsigned long blinkPeriodMs = 500;
+
+  if (totalPendingGlobal == 0) {
+    ledOff = true;
+  } else if (pct < 5.0f) {
+    blinkPeriodMs = 500;  // 1 Hz -> toggle every 500ms
+  } else if (pct < 80.0f) {
+    blinkPeriodMs = 100;  // 5 Hz -> toggle every 100ms
+  } else {
+    solid = true;
+  }
+
+  if (ledOff) {
+    ledWrite(false);
+    lastLedToggleAt = now;
+    ledOn = false;
+  } else if (solid) {
     ledWrite(true);
   } else if (now - lastLedToggleAt >= blinkPeriodMs) {
     lastLedToggleAt = now;
