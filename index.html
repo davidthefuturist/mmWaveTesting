@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0">
+<title>mmWave Lab Notebook</title>
+<style>
+  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; background: #f0f0f0; color: #000; padding: 20px; }
+  .container { max-width: 520px; margin: auto; border: 1px solid #333; padding: 20px; border-radius: 12px; background: #fff; }
+  h3 { margin-top: 0; }
+  h4 { margin: 0 0 8px 0; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; color: #666; }
+
+  .board {
+    margin-bottom: 20px; padding: 10px; background: #f4f4f4; border-radius: 6px;
+    font-size: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px;
+  }
+  .board .k { color: #666; }
+  .board .v { font-weight: bold; text-align: right; font-family: ui-monospace, monospace; }
+  .board .full-row { grid-column: 1 / -1; border-bottom: 1px solid #ddd; padding-bottom: 4px; margin-bottom: 2px; font-weight: bold; color: #000; }
+
+  table { width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 12px; }
+  thead th { padding: 8px 6px; border-bottom: 2px solid #eee; text-align: left; font-size: 10px; text-transform: uppercase; color: #888; }
+  tbody td { padding: 7px 6px; border-bottom: 1px solid #eee; }
+  tbody tr:last-child td { border-bottom: none; }
+
+  label { font-size: 11px; color: #666; font-weight: bold; text-transform: uppercase; display: block; margin-bottom: 5px; }
+  input[type="text"] {
+    width: 100%; box-sizing: border-box; padding: 12px; border-radius: 6px;
+    border: 1px solid #ccc; background: #fff; color: #000; font-size: 15px; outline: none;
+  }
+  input[type="text"]:focus { border-color: #e63946; }
+
+  .btn {
+    padding: 12px 24px; border-radius: 6px; border: none; font-weight: bold;
+    cursor: pointer; font-size: 14px; width: 100%; margin-top: 10px;
+  }
+  .btn-primary { background: #e63946; color: #fff; }
+  .btn-secondary { background: #333; color: #fff; }
+  .btn:disabled { background: #ccc; color: #888; cursor: not-allowed; }
+
+  .status-line { font-size: 12px; font-weight: bold; padding: 10px; border-radius: 6px; margin-bottom: 16px; background: #f4f4f4; color: #666; }
+  .status-line.connected { background: #eafaf0; color: #2a9d5c; }
+  .status-line.warn { background: #fff4e5; color: #b8730a; }
+
+  section { margin-bottom: 18px; }
+  .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h3>mmWave Lab Notebook</h3>
+
+  <div id="statusLine" class="status-line">Not connected</div>
+
+  <button id="connectBtn" class="btn btn-primary">CONNECT TO ESP32C6</button>
+
+  <div id="mainUI" style="display:none;">
+
+    <section>
+      <h4>Live Reading</h4>
+      <div class="board">
+        <div class="k">Distance</div><div class="v" id="liveDistance">--</div>
+        <div class="k">Presence</div><div class="v" id="livePresence">--</div>
+        <div class="k">Storage used</div><div class="v" id="liveStorage">--</div>
+        <div class="k">Device time synced</div><div class="v" id="liveTimeSync">--</div>
+      </div>
+    </section>
+
+    <section>
+      <h4>Experiment</h4>
+      <div class="board">
+        <div class="k">Active experiment</div><div class="v" id="expIdDisplay">none</div>
+        <div class="k">Pending on device</div><div class="v" id="expPending">0</div>
+      </div>
+      <div id="startBlock">
+        <label>Experiment name (optional)</label>
+        <input type="text" id="expNameInput" placeholder="e.g. doorway-trial-3">
+        <button id="startBtn" class="btn btn-primary">START EXPERIMENT</button>
+      </div>
+      <button id="stopBtn" class="btn btn-secondary" style="display:none;">STOP EXPERIMENT</button>
+    </section>
+
+    <section>
+      <h4>Sync to Google Sheet</h4>
+      <div class="board">
+        <div class="k">Synced this session</div><div class="v" id="syncedCount">0</div>
+        <div class="k">Failed / retrying</div><div class="v" id="failedCount">0</div>
+        <div class="k">Last sync pass</div><div class="v" id="lastSyncAt">never</div>
+      </div>
+    </section>
+
+    <section>
+      <h4>Activity Log</h4>
+      <table>
+        <thead><tr><th>Time</th><th>Event</th></tr></thead>
+        <tbody id="logBody"></tbody>
+      </table>
+    </section>
+
+  </div>
+
+  <p id="globalStatus" style="margin-top: 10px; font-size: 12px; color: #666;"></p>
+</div>
+
+<script>
+  // ============================================================
+  // CONFIG
+  // ============================================================
+  const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwxacd4umrkX36WmGI1uD9_Z-umrY2qu_MewEQrleVkzm1eNiM2lNn7QNOO3qzcPppV/exec';
+
+  const SERVICE_UUID = "0000ab00-0000-1000-8000-00805f9b34fb";
+  const CMD_UUID     = "0000ab01-0000-1000-8000-00805f9b34fb";
+  const READ_UUID    = "0000ab02-0000-1000-8000-00805f9b34fb";
+
+  const RECONCILE_INTERVAL_MS = 5000;
+  const QUERY_TIMEOUT_MS = 8000;
+
+  // ============================================================
+  // STATE
+  // ============================================================
+  let device, cmdChar, readChar;
+  let isConnected = false;
+  let pendingQuery = null; // { type: 'LISTEXP' | 'SYNCREQ', resolve, collected: [] }
+  let reconcileTimer = null;
+  let reconcileBusy = false;
+
+  let expActive = false;
+  let currentExpId = '';
+  let stopRequestedWhileDisconnected = false;
+
+  let syncedCountThisSession = 0;
+  let failedCountThisSession = 0;
+
+  // ============================================================
+  // UI HELPERS
+  // ============================================================
+  function setGlobalStatus(msg) {
+    document.getElementById('globalStatus').innerText = msg;
+  }
+
+  function logEvent(msg) {
+    const tbody = document.getElementById('logBody');
+    const tr = document.createElement('tr');
+    const t = new Date().toLocaleTimeString();
+    tr.innerHTML = `<td>${t}</td><td>${msg}</td>`;
+    tbody.insertBefore(tr, tbody.firstChild);
+    while (tbody.rows.length > 40) tbody.deleteRow(tbody.rows.length - 1);
+  }
+
+  function setStatusLine(text, cls) {
+    const el = document.getElementById('statusLine');
+    el.innerText = text;
+    el.className = 'status-line' + (cls ? ' ' + cls : '');
+  }
+
+  function refreshExperimentUI() {
+    document.getElementById('expIdDisplay').innerText = expActive ? currentExpId : 'none';
+    document.getElementById('startBlock').style.display = expActive ? 'none' : 'block';
+    document.getElementById('stopBtn').style.display = expActive ? 'block' : 'none';
+  }
+
+  // ============================================================
+  // BLE CONNECT
+  // ============================================================
+  document.getElementById('connectBtn').addEventListener('click', async () => {
+    try {
+      if (device && device.gatt) {
+        // Reconnect path: reuse the previously granted device, no new chooser.
+        await connectGatt(device);
+        return;
+      }
+      device = await navigator.bluetooth.requestDevice({
+        acceptAllDevices: true,
+        optionalServices: [SERVICE_UUID]
+      });
+      device.addEventListener('gattserverdisconnected', onDisconnected);
+      await connectGatt(device);
+    } catch (e) {
+      console.error(e);
+      setGlobalStatus('Connection failed: ' + (e.message || e));
+    }
+  });
+
+  async function connectGatt(dev) {
+    setStatusLine('Connecting...', 'warn');
+    const server = await dev.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    cmdChar = await service.getCharacteristic(CMD_UUID);
+    readChar = await service.getCharacteristic(READ_UUID);
+    await readChar.startNotifications();
+    readChar.addEventListener('characteristicvaluechanged', onNotify);
+
+    isConnected = true;
+    setStatusLine('Connected', 'connected');
+    document.getElementById('connectBtn').style.display = 'none';
+    document.getElementById('mainUI').style.display = 'block';
+
+    // Sync wall clock every time we (re)connect, so the ESP32's
+    // millis()-based clock gets corrected for drift.
+    await send('TIME', Math.floor(Date.now() / 1000));
+    logEvent('Connected, time synced');
+
+    // If the user asked to stop while disconnected, honor it now.
+    if (stopRequestedWhileDisconnected) {
+      stopRequestedWhileDisconnected = false;
+      await send('STOP', 0);
+      logEvent('Sent queued STOP command');
+    }
+
+    startReconcileLoop();
+  }
+
+  function onDisconnected() {
+    isConnected = false;
+    setStatusLine('Disconnected — data keeps recording on the device', 'warn');
+    document.getElementById('connectBtn').style.display = 'block';
+    document.getElementById('connectBtn').innerText = 'RECONNECT TO ESP32C6';
+    stopReconcileLoop();
+    logEvent('Disconnected');
+  }
+
+  async function send(type, val) {
+    if (!cmdChar) return;
+    await cmdChar.writeValue(new TextEncoder().encode(`${type}:${val}`));
+  }
+
+  // ============================================================
+  // NOTIFICATION PARSING
+  // ============================================================
+  function onNotify(e) {
+    const line = new TextDecoder().decode(e.target.value);
+    handleReport(line);
+  }
+
+  function handleReport(line) {
+    if (line.startsWith('S:')) {
+      // S:<active>:<exp_id>:<pending>:<storage_pct>
+      const p = line.split(':');
+      expActive = p[1] === '1';
+      currentExpId = p[2];
+      document.getElementById('expPending').innerText = p[3];
+      document.getElementById('liveStorage').innerText = p[4] + '%';
+      refreshExperimentUI();
+      return;
+    }
+    if (line.startsWith('D:')) {
+      // D:<index>:<distance>:<presence>
+      const p = line.split(':');
+      document.getElementById('liveDistance').innerText = p[2];
+      document.getElementById('livePresence').innerText = (p[3] === '1') ? 'PRESENT' : 'clear';
+      document.getElementById('liveTimeSync').innerText = 'yes';
+      return;
+    }
+    if (line.startsWith('X:')) {
+      if (pendingQuery && pendingQuery.type === 'LISTEXP') {
+        const list = line.substring(2);
+        const ids = list.length ? list.split(',') : [];
+        pendingQuery.resolve(ids);
+        pendingQuery = null;
+      }
+      return;
+    }
+    if (line.startsWith('B:')) {
+      if (pendingQuery && pendingQuery.type === 'SYNCREQ') {
+        // B:<exp_id>:<index>:<timestamp>:<distance>:<presence>
+        const p = line.split(':');
+        pendingQuery.collected.push({
+          exp_id: p[1], index: Number(p[2]), timestamp: Number(p[3]),
+          distance: Number(p[4]), presence: Number(p[5])
+        });
+      }
+      return;
+    }
+    if (line.startsWith('E:')) {
+      if (pendingQuery && pendingQuery.type === 'SYNCREQ') {
+        const p = line.split(':');
+        pendingQuery.resolve({ rows: pendingQuery.collected, remaining: Number(p[2]) });
+        pendingQuery = null;
+      }
+      return;
+    }
+    if (line.startsWith('ACK:DEL:')) {
+      const parts = line.split(':'); // ACK:DEL:<exp_id>:<index>
+      logEvent(`Device confirmed delete: ${parts[2]} #${parts[3]}`);
+      return;
+    }
+  }
+
+  // Sends a query command and waits for its terminal report.
+  // Only one query may be outstanding at a time.
+  function sendQuery(type, cmdType, cmdVal) {
+    return new Promise((resolve) => {
+      if (pendingQuery) { resolve(null); return; }
+      const q = { type, resolve, collected: [] };
+      pendingQuery = q;
+      send(cmdType, cmdVal);
+      setTimeout(() => {
+        if (pendingQuery === q) {
+          pendingQuery = null;
+          resolve(null); // timed out
+        }
+      }, QUERY_TIMEOUT_MS);
+    });
+  }
+
+  // ============================================================
+  // EXPERIMENT START / STOP
+  // ============================================================
+  document.getElementById('startBtn').addEventListener('click', async () => {
+    if (!isConnected) { setGlobalStatus('Connect first.'); return; }
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const expId = `exp_${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_` +
+                  `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    const name = document.getElementById('expNameInput').value.trim();
+    await send('START', `${expId},${name}`);
+    logEvent(`Started experiment ${expId}${name ? ' (' + name + ')' : ''}`);
+  });
+
+  document.getElementById('stopBtn').addEventListener('click', async () => {
+    if (isConnected) {
+      await send('STOP', 0);
+      logEvent('Sent STOP command');
+    } else {
+      stopRequestedWhileDisconnected = true;
+      setStatusLine('Reconnect to send Stop — tap Reconnect below', 'warn');
+      logEvent('Stop requested, but disconnected — will send on reconnect');
+    }
+  });
+
+  // ============================================================
+  // JSONP fetch from Apps Script (fetch()/CORS is unreliable on
+  // script.google.com, so we load the response as a <script> tag instead)
+  // ============================================================
+  function fetchSheetRows(expId) {
+    return new Promise((resolve, reject) => {
+      const cbName = 'jsonp_cb_' + Math.random().toString(36).slice(2);
+      const script = document.createElement('script');
+      const timeout = setTimeout(() => { cleanup(); reject(new Error('timeout')); }, 10000);
+      function cleanup() {
+        clearTimeout(timeout);
+        delete window[cbName];
+        if (script.parentNode) script.parentNode.removeChild(script);
+      }
+      window[cbName] = (data) => { cleanup(); resolve(data); };
+      script.onerror = () => { cleanup(); reject(new Error('load error')); };
+      script.src = `${APPS_SCRIPT_URL}?exp=${encodeURIComponent(expId)}&action=list&callback=${cbName}`;
+      document.body.appendChild(script);
+    });
+  }
+
+  function postRowsToSheet(expId, name, rows) {
+    // Fire-and-forget: no-cors POST makes the response unreadable, but the
+    // NEXT reconciliation pass re-reads the Sheet via JSONP and will only
+    // send DEL once it independently confirms the row matches. If this
+    // POST silently fails, that re-check just won't match yet and we retry.
+    return fetch(APPS_SCRIPT_URL, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+      body: JSON.stringify({ exp_id: expId, name: name, rows: rows })
+    });
+  }
+
+  function rowsMatch(device, sheet) {
+    if (!sheet) return false;
+    const ts = Number(sheet.timestamp), dist = Number(sheet.distance), pres = Number(sheet.presence);
+    return (ts === device.timestamp) &&
+           (Math.abs(dist - device.distance) < 0.05) &&
+           (pres === device.presence);
+  }
+
+  // ============================================================
+  // RECONCILIATION LOOP
+  // ============================================================
+  function startReconcileLoop() {
+    stopReconcileLoop();
+    reconcileTimer = setInterval(reconcileOnce, RECONCILE_INTERVAL_MS);
+    reconcileOnce(); // immediate first pass
+  }
+
+  function stopReconcileLoop() {
+    if (reconcileTimer) { clearInterval(reconcileTimer); reconcileTimer = null; }
+  }
+
+  async function reconcileOnce() {
+    if (!isConnected || reconcileBusy) return;
+    reconcileBusy = true;
+    try {
+      const expIds = await sendQuery('LISTEXP', 'LISTEXP', 0);
+      const idsToSync = new Set(expIds || []);
+      if (currentExpId) idsToSync.add(currentExpId); // cover an active exp with no backlog yet
+
+      for (const expId of idsToSync) {
+        if (!expId) continue;
+        await syncExperiment(expId);
+      }
+
+      document.getElementById('syncedCount').innerText = syncedCountThisSession;
+      document.getElementById('failedCount').innerText = failedCountThisSession;
+      document.getElementById('lastSyncAt').innerText = new Date().toLocaleTimeString();
+    } catch (e) {
+      console.error('Reconcile error', e);
+      failedCountThisSession++;
+    } finally {
+      reconcileBusy = false;
+    }
+  }
+
+  async function syncExperiment(expId) {
+    let sheetRowsById;
+    try {
+      const sheetData = await fetchSheetRows(expId);
+      sheetRowsById = {};
+      (sheetData.rows || []).forEach(r => { sheetRowsById[Number(r.index)] = r; });
+    } catch (e) {
+      console.warn('Sheet fetch failed for', expId, e);
+      failedCountThisSession++;
+      return; // try again next pass
+    }
+
+    const backlog = await sendQuery('SYNCREQ', 'SYNCREQ', expId);
+    if (!backlog) return; // timed out or busy, try again next pass
+
+    const toPost = [];
+    const toDelete = [];
+
+    backlog.rows.forEach(row => {
+      const sheetRow = sheetRowsById[row.index];
+      if (!sheetRow) {
+        toPost.push(row);
+      } else if (!rowsMatch(row, sheetRow)) {
+        toPost.push(row);
+      } else {
+        toDelete.push(row.index);
+      }
+    });
+
+    if (toPost.length > 0) {
+      const name = document.getElementById('expNameInput').value.trim();
+      await postRowsToSheet(expId, name, toPost);
+      logEvent(`Posted ${toPost.length} row(s) to Sheet for ${expId}`);
+    }
+
+    for (const idx of toDelete) {
+      await send('DEL', `${expId}:${idx}`);
+      syncedCountThisSession++;
+    }
+
+    if (backlog.remaining > 0) {
+      // More rows exist beyond this batch; next reconcile pass will pick
+      // them up (keeps each pass bounded instead of looping forever here).
+      logEvent(`${expId}: ${backlog.remaining} row(s) still pending on device`);
+    }
+  }
+</script>
+</body>
+</html>
