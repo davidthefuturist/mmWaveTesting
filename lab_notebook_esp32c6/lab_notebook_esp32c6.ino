@@ -36,7 +36,10 @@
  *                              sent by the phone after it has confirmed
  *                              the row is safely in the Sheet.
  *
- * ESP32 -> Phone (notify on READ_UUID), each sent as its own notification:
+ * ESP32 -> Phone (notify on READ_UUID). Most reports are one per
+ * notification, but B: backlog rows are batched several-per-notification
+ * (joined by '|', VESC-tuner style) to cut BLE overhead on large syncs --
+ * the phone splits each incoming notification on '|' before parsing:
  *   S:<active>:<exp_id>:<pending_count>:<storage_pct>
  *                              Heartbeat, ~every 2s. active is 0/1.
  *                              pending_count = undeleted rows in the
@@ -69,6 +72,8 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "Seeed_Arduino_mmWave.h"
 
 #ifdef ESP32
@@ -127,6 +132,17 @@ unsigned long lastHeartbeatAt = 0;
 unsigned long lastLedToggleAt = 0;
 bool ledOn = false;
 
+// LittleFS is touched from two different FreeRTOS tasks -- the Arduino
+// main loop (sampling, once/sec) and the BLE command callback (LISTEXP/
+// SYNCREQ/DEL, on the BLE stack's own task). Without serializing access,
+// a directory scan running concurrently with a new sample being written
+// corrupts LittleFS's directory iteration (duplicate/skipped entries).
+// Recursive so nested calls (e.g. handleSyncReq calling countPending)
+// from the same task don't deadlock.
+SemaphoreHandle_t fsMutex;
+void fsLock() { xSemaphoreTakeRecursive(fsMutex, portMAX_DELAY); }
+void fsUnlock() { xSemaphoreGiveRecursive(fsMutex); }
+
 // ---------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------
@@ -169,9 +185,11 @@ void notifyLine(const String &line) {
 // Persisted state (/state.txt) -- simple key=value lines, no JSON lib needed
 // ---------------------------------------------------------------------
 void saveState() {
+  fsLock();
   File f = LittleFS.open("/state.txt", "w");
   if (!f) {
     Serial.println("ERROR: failed to open /state.txt for write");
+    fsUnlock();
     return;
   }
   f.printf("active=%d\n", expActive ? 1 : 0);
@@ -179,12 +197,14 @@ void saveState() {
   f.printf("exp_name=%s\n", currentExpName.c_str());
   f.printf("next_index=%lu\n", (unsigned long)nextIndex);
   f.close();
+  fsUnlock();
 }
 
 void loadState() {
-  if (!LittleFS.exists("/state.txt")) return;
+  fsLock();
+  if (!LittleFS.exists("/state.txt")) { fsUnlock(); return; }
   File f = LittleFS.open("/state.txt", "r");
-  if (!f) return;
+  if (!f) { fsUnlock(); return; }
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
@@ -198,6 +218,7 @@ void loadState() {
     else if (key == "next_index") nextIndex = (uint32_t) val.toInt();
   }
   f.close();
+  fsUnlock();
   Serial.printf("Loaded state: active=%d exp_id=%s next_index=%lu\n",
                 expActive, currentExpId.c_str(), (unsigned long)nextIndex);
 }
@@ -214,22 +235,26 @@ String sampleFilePath(const String &expId, uint32_t index) {
 }
 
 void ensureExpDir(const String &expId) {
+  fsLock();
   String dir = expDir(expId);
   if (!LittleFS.exists(dir)) {
     LittleFS.mkdir(dir);
   }
+  fsUnlock();
 }
 
 // Counts undeleted sample files in an experiment folder.
 uint32_t countPending(const String &expId) {
+  fsLock();
   uint32_t count = 0;
   File dir = LittleFS.open(expDir(expId));
-  if (!dir || !dir.isDirectory()) return 0;
+  if (!dir || !dir.isDirectory()) { fsUnlock(); return 0; }
   File entry = dir.openNextFile();
   while (entry) {
     if (!entry.isDirectory()) count++;
     entry = dir.openNextFile();
   }
+  fsUnlock();
   return count;
 }
 
@@ -247,10 +272,12 @@ void captureSample() {
   uint32_t idx = nextIndex;
   uint32_t ts = nowUnixSec(); // 0 if never time-synced -- phone should sync ASAP on connect
 
+  fsLock();
   ensureExpDir(currentExpId);
   File f = LittleFS.open(sampleFilePath(currentExpId, idx), "w");
   if (!f) {
     Serial.println("ERROR: failed to write sample file");
+    fsUnlock();
     return;
   }
   f.printf("%lu,%.1f,%d\n", (unsigned long)ts, lastDistance, lastPresence ? 1 : 0);
@@ -258,6 +285,7 @@ void captureSample() {
 
   nextIndex++;
   saveState(); // small file, cheap enough to persist every sample for reboot-safety
+  fsUnlock();
 
   if (deviceConnected) {
     String line = "D:" + String(idx) + ":" + String(lastDistance, 1) + ":" + String(lastPresence ? 1 : 0);
@@ -294,6 +322,7 @@ void handleStop() {
 }
 
 void handleListExp() {
+  fsLock();
   String result = "";
   File root = LittleFS.open("/");
   File entry = root.openNextFile();
@@ -315,6 +344,7 @@ void handleListExp() {
     }
     entry = root.openNextFile();
   }
+  fsUnlock();
   Serial.println("LISTEXP result: [" + result + "]");
   notifyLine("X:" + result);
 }
@@ -322,16 +352,33 @@ void handleListExp() {
 void handleSyncReq(const String &expId) {
   String dirPath = expDir(expId);
   Serial.printf("SYNCREQ received for '%s' (dirPath='%s')\n", expId.c_str(), dirPath.c_str());
+
+  fsLock();
+
   if (!LittleFS.exists(dirPath)) {
+    fsUnlock();
     Serial.println("SYNCREQ: dir does not exist, replying E:0");
     notifyLine("E:" + expId + ":0");
     return;
   }
 
+  // Snapshot the pending count up front, before the scan, so a sample
+  // written mid-scan (blocked by the mutex until we're done anyway,
+  // but conceptually) doesn't skew what "remaining" means for this pass.
+  uint32_t totalPending = countPending(expId);
+
   File dir = LittleFS.open(dirPath);
   File entry = dir.openNextFile();
   uint32_t sent = 0;
-  uint32_t totalPending = countPending(expId);
+
+  // Batch several rows into each BLE notification instead of one
+  // notify() per row -- each notify() call has real overhead, and at
+  // large backlog sizes that overhead alone was making a sync pass take
+  // longer than new samples take to accumulate (a diverging backlog).
+  const uint32_t MAX_ROWS_PER_NOTIFY = 6;
+  const size_t MAX_BATCH_CHARS = 160; // stay well under typical BLE MTU
+  String batch = "";
+  uint32_t rowsInBatch = 0;
 
   while (entry && sent < SYNC_BATCH_MAX) {
     if (!entry.isDirectory()) {
@@ -352,12 +399,27 @@ void handleSyncReq(const String &expId) {
         String ts = content.substring(0, c1);
         String dist = content.substring(c1 + 1, c2);
         String pres = content.substring(c2 + 1);
-        notifyLine("B:" + expId + ":" + idxStr + ":" + ts + ":" + dist + ":" + pres);
+        String rowStr = "B:" + expId + ":" + idxStr + ":" + ts + ":" + dist + ":" + pres;
+
+        if (rowsInBatch >= MAX_ROWS_PER_NOTIFY ||
+            (batch.length() > 0 && batch.length() + 1 + rowStr.length() > MAX_BATCH_CHARS)) {
+          notifyLine(batch);
+          batch = "";
+          rowsInBatch = 0;
+        }
+        if (batch.length() > 0) batch += "|";
+        batch += rowStr;
+        rowsInBatch++;
         sent++;
       }
     }
     entry = dir.openNextFile();
   }
+  if (batch.length() > 0) {
+    notifyLine(batch);
+  }
+
+  fsUnlock();
 
   uint32_t remaining = (totalPending > sent) ? (totalPending - sent) : 0;
   Serial.printf("SYNCREQ '%s': sent=%lu totalPending=%lu remaining=%lu\n",
@@ -371,9 +433,11 @@ void handleDelete(const String &rest) {
   String expId = rest.substring(0, colon);
   String idxStr = rest.substring(colon + 1);
   String path = sampleFilePath(expId, (uint32_t) idxStr.toInt());
+  fsLock();
   if (LittleFS.exists(path)) {
     LittleFS.remove(path);
   }
+  fsUnlock();
   notifyLine("ACK:DEL:" + expId + ":" + idxStr);
 }
 
@@ -432,6 +496,8 @@ class CmdCallbacks : public BLECharacteristicCallbacks {
 void setup() {
   Serial.begin(115200);
   delay(200);
+
+  fsMutex = xSemaphoreCreateRecursiveMutex();
 
   pinMode(USER_LED_PIN, OUTPUT);
   ledWrite(false);

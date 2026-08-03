@@ -427,7 +427,10 @@
     }
 
     const backlog = await sendQuery('SYNCREQ', 'SYNCREQ', expId);
-    if (!backlog) return; // timed out or busy, try again next pass
+    if (!backlog) {
+      logEvent(`SYNCREQ timed out or busy for ${expId}`);
+      return; // timed out or busy, try again next pass
+    }
 
     const toPost = [];
     const toDelete = [];
@@ -443,10 +446,16 @@
       }
     });
 
+    logEvent(`${expId}: sheet=${Object.keys(sheetRowsById).length} backlog=${backlog.rows.length} toPost=${toPost.length} toDelete=${toDelete.length}`);
+
     if (toPost.length > 0) {
       const name = document.getElementById('expNameInput').value.trim();
-      await postRowsToSheet(expId, name, toPost);
-      logEvent(`Posted ${toPost.length} row(s) to Sheet for ${expId}`);
+      try {
+        await postRowsToSheet(expId, name, toPost);
+        logEvent(`Posted ${toPost.length} row(s) to Sheet for ${expId}`);
+      } catch (e) {
+        logEvent(`POST FAILED for ${expId}: ${e.message}`);
+      }
     }
 
     for (const idx of toDelete) {
