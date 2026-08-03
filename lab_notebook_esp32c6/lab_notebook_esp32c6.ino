@@ -301,8 +301,13 @@ void handleListExp() {
   while (entry) {
     if (entry.isDirectory()) {
       String name = String(entry.name());
-      // Only report folders that still have at least one pending sample file
-      if (countPending(name) > 0) {
+      // LittleFS core versions differ on whether directory entries come
+      // back with a leading slash ("/exp_...") or bare ("exp_..."row).
+      // Normalize to bare so it matches expDir()'s "/" + expId convention.
+      if (name.startsWith("/")) name = name.substring(1);
+      uint32_t pending = countPending(name);
+      Serial.printf("LISTEXP: found dir '%s' pending=%lu\n", name.c_str(), (unsigned long)pending);
+      if (pending > 0) {
         if (!first) result += ",";
         result += name;
         first = false;
@@ -310,12 +315,15 @@ void handleListExp() {
     }
     entry = root.openNextFile();
   }
+  Serial.println("LISTEXP result: [" + result + "]");
   notifyLine("X:" + result);
 }
 
 void handleSyncReq(const String &expId) {
   String dirPath = expDir(expId);
+  Serial.printf("SYNCREQ received for '%s' (dirPath='%s')\n", expId.c_str(), dirPath.c_str());
   if (!LittleFS.exists(dirPath)) {
+    Serial.println("SYNCREQ: dir does not exist, replying E:0");
     notifyLine("E:" + expId + ":0");
     return;
   }
@@ -352,6 +360,8 @@ void handleSyncReq(const String &expId) {
   }
 
   uint32_t remaining = (totalPending > sent) ? (totalPending - sent) : 0;
+  Serial.printf("SYNCREQ '%s': sent=%lu totalPending=%lu remaining=%lu\n",
+                expId.c_str(), (unsigned long)sent, (unsigned long)totalPending, (unsigned long)remaining);
   notifyLine("E:" + expId + ":" + String(remaining));
 }
 
@@ -368,6 +378,7 @@ void handleDelete(const String &rest) {
 }
 
 void handleCommand(const String &raw) {
+  Serial.println("CMD RX: " + raw);
   String type, rest;
   splitCommand(raw, type, rest);
 

@@ -106,7 +106,7 @@
   // ============================================================
   // CONFIG
   // ============================================================
-  const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwxacd4umrkX36WmGI1uD9_Z-umrY2qu_MewEQrleVkzm1eNiM2lNn7QNOO3qzcPppV/exec';
+  const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwArNYYpxfr-JOvu-qmP6CFJGjOvFEX__hiS0AMttti8BdbcAviV9hHdjXzBTcwASVW/exec';
 
   const SERVICE_UUID = "0000ab00-0000-1000-8000-00805f9b34fb";
   const CMD_UUID     = "0000ab01-0000-1000-8000-00805f9b34fb";
@@ -228,8 +228,13 @@
   // NOTIFICATION PARSING
   // ============================================================
   function onNotify(e) {
-    const line = new TextDecoder().decode(e.target.value);
-    handleReport(line);
+    const raw = new TextDecoder().decode(e.target.value);
+    // The ESP32 now batches multiple reports into one notification,
+    // separated by '|' (e.g. several B: backlog rows at once) to cut
+    // BLE overhead. Split before parsing.
+    raw.split('|').forEach(line => {
+      if (line) handleReport(line);
+    });
   }
 
   function handleReport(line) {
