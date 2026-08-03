@@ -114,6 +114,7 @@
 
   const RECONCILE_INTERVAL_MS = 5000;
   const QUERY_TIMEOUT_MS = 8000;
+  const SYNCREQ_TIMEOUT_MS = 45000; // large backlogs can legitimately take 15-20s+
 
   // ============================================================
   // STATE
@@ -126,7 +127,7 @@
 
   let expActive = false;
   let currentExpId = '';
-  let stopRequestedWhileDisconnected = false;
+  let stopRequestedWhileDisconnected = (localStorage.getItem('labNotebook.pendingStop') === '1');
 
   let syncedCountThisSession = 0;
   let failedCountThisSession = 0;
@@ -203,6 +204,7 @@
     // If the user asked to stop while disconnected, honor it now.
     if (stopRequestedWhileDisconnected) {
       stopRequestedWhileDisconnected = false;
+      localStorage.removeItem('labNotebook.pendingStop');
       await send('STOP', 0);
       logEvent('Sent queued STOP command');
     }
@@ -293,7 +295,7 @@
 
   // Sends a query command and waits for its terminal report.
   // Only one query may be outstanding at a time.
-  function sendQuery(type, cmdType, cmdVal) {
+  function sendQuery(type, cmdType, cmdVal, timeoutMs) {
     return new Promise((resolve) => {
       if (pendingQuery) { resolve(null); return; }
       const q = { type, resolve, collected: [] };
@@ -304,7 +306,7 @@
           pendingQuery = null;
           resolve(null); // timed out
         }
-      }, QUERY_TIMEOUT_MS);
+      }, timeoutMs || QUERY_TIMEOUT_MS);
     });
   }
 
@@ -328,6 +330,7 @@
       logEvent('Sent STOP command');
     } else {
       stopRequestedWhileDisconnected = true;
+      localStorage.setItem('labNotebook.pendingStop', '1');
       setStatusLine('Reconnect to send Stop — tap Reconnect below', 'warn');
       logEvent('Stop requested, but disconnected — will send on reconnect');
     }
@@ -426,7 +429,7 @@
       return; // try again next pass
     }
 
-    const backlog = await sendQuery('SYNCREQ', 'SYNCREQ', expId);
+    const backlog = await sendQuery('SYNCREQ', 'SYNCREQ', expId, SYNCREQ_TIMEOUT_MS);
     if (!backlog) {
       logEvent(`SYNCREQ timed out or busy for ${expId}`);
       return; // timed out or busy, try again next pass
@@ -469,6 +472,14 @@
       logEvent(`${expId}: ${backlog.remaining} row(s) still pending on device`);
     }
   }
+
+  // ============================================================
+  // INIT — restore any state that survives a page refresh
+  // ============================================================
+  if (stopRequestedWhileDisconnected) {
+    setStatusLine('A Stop was requested before this page reloaded — reconnect to send it', 'warn');
+  }
+
 </script>
 </body>
 </html>
