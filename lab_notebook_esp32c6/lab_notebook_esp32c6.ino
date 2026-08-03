@@ -433,7 +433,7 @@ void setup() {
   mmWaveSerial.begin(115200);
   mmWave.begin(&mmWaveSerial);
 
-  BLEDevice::init("LabNotebook-ESP32C6");
+  BLEDevice::init("mmWaveTester");
   bleServer = BLEDevice::createServer();
   bleServer->setCallbacks(new ServerCallbacks());
 
@@ -454,7 +454,7 @@ void setup() {
   advertising->setScanResponse(true);
   BLEDevice::startAdvertising();
 
-  Serial.println("BLE advertising as LabNotebook-ESP32C6");
+  Serial.println("BLE advertising as mmWaveTester");
 }
 
 void loop() {

@@ -401,6 +401,7 @@
       document.getElementById('lastSyncAt').innerText = new Date().toLocaleTimeString();
     } catch (e) {
       console.error('Reconcile error', e);
+      logEvent(`Reconcile pass FAILED: ${e.message}`);
       failedCountThisSession++;
     } finally {
       reconcileBusy = false;
@@ -415,6 +416,7 @@
       (sheetData.rows || []).forEach(r => { sheetRowsById[Number(r.index)] = r; });
     } catch (e) {
       console.warn('Sheet fetch failed for', expId, e);
+      logEvent(`Sheet fetch FAILED for ${expId}: ${e.message}`);
       failedCountThisSession++;
       return; // try again next pass
     }

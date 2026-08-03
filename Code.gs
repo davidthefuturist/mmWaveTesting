@@ -10,9 +10,6 @@
  * 1. Create (or pick) a Drive folder to hold all experiment Sheets.
  *    Open it in the browser and copy the ID from the URL:
  *    https://drive.google.com/drive/folders/<THIS_PART_IS_THE_ID>
- * 
-
- * 
  * 2. Paste that ID into FOLDER_ID below.
  * 3. Extensions > Apps Script in a blank Google Sheet (or script.google.com),
  *    paste this file in as Code.gs.
@@ -136,8 +133,7 @@ function getExperimentSheet(expId, createIfMissing, name) {
   const ss = SpreadsheetApp.create(expId);
   const file = DriveApp.getFileById(ss.getId());
   file.setName(displayName === expId ? expId : expId); // keep filename = expId for lookup
-  folder.addFile(file);
-  DriveApp.getRootFolder().removeFile(file); // move out of root My Drive
+  file.moveTo(folder); // moves out of root My Drive into the fixed folder
 
   const sheet = ss.getSheets()[0];
   sheet.setName('data');
