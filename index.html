@@ -64,6 +64,14 @@
         <div class="k">Storage used</div><div class="v" id="liveStorage">--</div>
         <div class="k">Device time synced</div><div class="v" id="liveTimeSync">--</div>
       </div>
+      <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px;">
+        <span style="font-size:11px; color:#888; text-transform:uppercase; font-weight:bold;">Distance, last 60s</span>
+        <span style="font-size:10px; color:#aaa;" id="chartRange">--</span>
+      </div>
+      <svg id="distanceChart" viewBox="0 0 500 130" style="width:100%; background:#fafafa; border:1px solid #eee; border-radius:6px;">
+        <polyline id="distanceChartLine" fill="none" stroke="#e63946" stroke-width="2" points=""></polyline>
+        <g id="distanceChartDots"></g>
+      </svg>
     </section>
 
     <section>
@@ -161,6 +169,53 @@
   }
 
   // ============================================================
+  // LIVE DISTANCE CHART — rolling last 60 readings (~60s at 1/sec)
+  // ============================================================
+  const DISTANCE_HISTORY_MAX = 60;
+  const distanceHistory = []; // [{distance, presence}, ...]
+
+  function pushDistanceHistory(distance, presence) {
+    if (!isFinite(distance)) return;
+    distanceHistory.push({ distance, presence });
+    if (distanceHistory.length > DISTANCE_HISTORY_MAX) distanceHistory.shift();
+    redrawDistanceChart();
+  }
+
+  function redrawDistanceChart() {
+    const W = 500, H = 130, PAD = 10;
+    if (distanceHistory.length === 0) return;
+
+    const values = distanceHistory.map(d => d.distance);
+    let min = Math.min(...values), max = Math.max(...values);
+    if (min === max) { min -= 1; max += 1; } // avoid a flat divide-by-zero scale
+    const range = max - min;
+    const padded = range * 0.1;
+    min -= padded; max += padded;
+
+    document.getElementById('chartRange').innerText =
+      `${Math.min(...values).toFixed(1)} – ${Math.max(...values).toFixed(1)}`;
+
+    const xStep = distanceHistory.length > 1 ? (W - 2 * PAD) / (DISTANCE_HISTORY_MAX - 1) : 0;
+    // Right-align so the newest point is always at the right edge, even
+    // with fewer than 60 points collected so far.
+    const startIdx = DISTANCE_HISTORY_MAX - distanceHistory.length;
+
+    const points = distanceHistory.map((d, i) => {
+      const x = PAD + (startIdx + i) * xStep;
+      const y = H - PAD - ((d.distance - min) / (max - min)) * (H - 2 * PAD);
+      return { x, y, presence: d.presence };
+    });
+
+    const polyline = document.getElementById('distanceChartLine');
+    polyline.setAttribute('points', points.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' '));
+
+    const dotsGroup = document.getElementById('distanceChartDots');
+    dotsGroup.innerHTML = points.map(p =>
+      `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="2.5" fill="${p.presence ? '#e63946' : '#ccc'}" />`
+    ).join('');
+  }
+
+  // ============================================================
   // BLE CONNECT
   // ============================================================
   document.getElementById('connectBtn').addEventListener('click', async () => {
@@ -251,11 +306,15 @@
       return;
     }
     if (line.startsWith('D:')) {
-      // D:<index>:<distance>:<presence>
+      // D:<distance>:<presence> -- sent once/sec whenever connected,
+      // regardless of whether an experiment is recording.
       const p = line.split(':');
-      document.getElementById('liveDistance').innerText = p[2];
-      document.getElementById('livePresence').innerText = (p[3] === '1') ? 'PRESENT' : 'clear';
+      const distance = Number(p[1]);
+      const presence = p[2] === '1';
+      document.getElementById('liveDistance').innerText = p[1];
+      document.getElementById('livePresence').innerText = presence ? 'PRESENT' : 'clear';
       document.getElementById('liveTimeSync').innerText = 'yes';
+      pushDistanceHistory(distance, presence);
       return;
     }
     if (line.startsWith('X:')) {

@@ -42,12 +42,14 @@
  * the phone splits each incoming notification on '|' before parsing:
  *   S:<active>:<exp_id>:<pending_count>:<storage_pct>
  *                              Heartbeat, ~every 2s. active is 0/1.
- *                              pending_count = undeleted rows in the
- *                              CURRENTLY ACTIVE experiment only.
- *   D:<index>:<distance>:<presence>
- *                              Live sample, sent right after capture,
- *                              only while connected AND an experiment
- *                              is active. Presence is 0/1.
+ *                              pending_count = GLOBAL total undeleted
+ *                              rows across ALL experiments (not just the
+ *                              active one) -- includes backlog left over
+ *                              from a stopped-but-not-fully-synced run.
+ *   D:<distance>:<presence>
+ *                              Live sample, sent once/sec whenever
+ *                              connected -- regardless of whether an
+ *                              experiment is recording. Presence is 0/1.
  *   X:<exp_id1>,<exp_id2>,...  Reply to LISTEXP. Empty string if none.
  *   B:<exp_id>:<index>:<timestamp>:<distance>:<presence>
  *                              One backlog row, reply to SYNCREQ.
@@ -95,7 +97,7 @@ SEEED_MR60BHA2 mmWave;
 
 #define SAMPLE_INTERVAL_MS   1000UL
 #define HEARTBEAT_INTERVAL_MS 2000UL
-#define SYNC_BATCH_MAX         50    // max rows sent per single SYNCREQ
+#define SYNC_BATCH_MAX         20    // max rows sent per single SYNCREQ
 #define BLE_NOTIFY_GAP_MS     15     // spacing between back-to-back notifications
 #define STORAGE_PAUSE_PCT     95     // stop sampling above this usage to protect flash
 
@@ -278,6 +280,19 @@ uint32_t countPending(const String &expId) {
 // ---------------------------------------------------------------------
 // Sampling
 // ---------------------------------------------------------------------
+// Broadcasts the current live reading to the connected phone, regardless
+// of whether an experiment is recording -- the person should be able to
+// see the sensor working the moment they connect, not just once they
+// hit Start.
+void broadcastLiveReading() {
+  if (!deviceConnected) return;
+  if (!haveSensorReading) return; // nothing from the sensor yet
+  String line = "D:" + String(lastDistance, 1) + ":" + String(lastPresence ? 1 : 0);
+  notifyLine(line);
+}
+
+// Persists the current reading to flash as the next indexed sample of
+// the active experiment. Only called while recording.
 void captureSample() {
   if (!expActive) return;
   if (storagePct() >= STORAGE_PAUSE_PCT) {
@@ -304,11 +319,6 @@ void captureSample() {
   pendingCountByExp[currentExpId]++;
   saveState(); // small file, cheap enough to persist every sample for reboot-safety
   fsUnlock();
-
-  if (deviceConnected) {
-    String line = "D:" + String(idx) + ":" + String(lastDistance, 1) + ":" + String(lastPresence ? 1 : 0);
-    notifyLine(line);
-  }
 }
 
 // ---------------------------------------------------------------------
@@ -603,21 +613,24 @@ void loop() {
 
   unsigned long now = millis();
 
-  // 1 Hz sampling, independent of BLE connection state
+  // 1 Hz tick: live reading always goes out over BLE if connected;
+  // persisting to storage only happens while an experiment is recording.
   if (now - lastSampleAt >= SAMPLE_INTERVAL_MS) {
     lastSampleAt = now;
+    broadcastLiveReading();
     captureSample();
   }
 
   // Heartbeat status report
   if (deviceConnected && (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS)) {
     lastHeartbeatAt = now;
-    fsLock();
-    auto it = pendingCountByExp.find(currentExpId);
-    uint32_t pending = (expActive && it != pendingCountByExp.end()) ? it->second : 0;
-    fsUnlock();
+    // "pending" is the GLOBAL total across all experiments (active or
+    // stopped-but-not-yet-synced) -- what the phone actually wants to
+    // show is "how much is left to sync overall", not just whatever
+    // happens to still be recording. Uses the same cached total the LED
+    // logic maintains, so no extra cost here.
     String line = "S:" + String(expActive ? 1 : 0) + ":" + currentExpId + ":" +
-                  String(pending) + ":" + String(storagePct(), 1);
+                  String(totalPendingGlobal) + ":" + String(storagePct(), 1);
     notifyLine(line);
   }
 
