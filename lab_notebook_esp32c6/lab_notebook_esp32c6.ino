@@ -93,7 +93,7 @@ SEEED_MR60BHA2 mmWave;
 
 #define SAMPLE_INTERVAL_MS   1000UL
 #define HEARTBEAT_INTERVAL_MS 2000UL
-#define SYNC_BATCH_MAX        200    // max rows sent per single SYNCREQ
+#define SYNC_BATCH_MAX         20    // max rows sent per single SYNCREQ
 #define BLE_NOTIFY_GAP_MS     15     // spacing between back-to-back notifications
 #define STORAGE_PAUSE_PCT     95     // stop sampling above this usage to protect flash
 

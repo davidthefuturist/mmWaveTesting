@@ -114,7 +114,7 @@
 
   const RECONCILE_INTERVAL_MS = 5000;
   const QUERY_TIMEOUT_MS = 8000;
-  const SYNCREQ_TIMEOUT_MS = 45000; // large backlogs can legitimately take 15-20s+
+  const SYNCREQ_TIMEOUT_MS = 15000; // 20-row batches should finish in ~2s; generous margin for slow links
 
   // ============================================================
   // STATE
@@ -417,6 +417,19 @@
   }
 
   async function syncExperiment(expId) {
+    // Drain several batches within this one pass rather than waiting for
+    // the next external 5s tick each time -- bounded so a huge backlog
+    // can't monopolize the loop indefinitely.
+    const MAX_BATCHES_PER_PASS = 8;
+    for (let batchNum = 0; batchNum < MAX_BATCHES_PER_PASS; batchNum++) {
+      const keepGoing = await syncExperimentBatch(expId);
+      if (!keepGoing) break;
+    }
+  }
+
+  // Returns true if there's more to sync (caller should call again),
+  // false if this experiment is caught up (or this pass hit an error).
+  async function syncExperimentBatch(expId) {
     let sheetRowsById;
     try {
       const sheetData = await fetchSheetRows(expId);
@@ -426,13 +439,13 @@
       console.warn('Sheet fetch failed for', expId, e);
       logEvent(`Sheet fetch FAILED for ${expId}: ${e.message}`);
       failedCountThisSession++;
-      return; // try again next pass
+      return false; // try again next pass
     }
 
     const backlog = await sendQuery('SYNCREQ', 'SYNCREQ', expId, SYNCREQ_TIMEOUT_MS);
     if (!backlog) {
       logEvent(`SYNCREQ timed out or busy for ${expId}`);
-      return; // timed out or busy, try again next pass
+      return false; // timed out or busy, try again next pass
     }
 
     const toPost = [];
@@ -467,10 +480,10 @@
     }
 
     if (backlog.remaining > 0) {
-      // More rows exist beyond this batch; next reconcile pass will pick
-      // them up (keeps each pass bounded instead of looping forever here).
       logEvent(`${expId}: ${backlog.remaining} row(s) still pending on device`);
+      return true; // keep draining within this pass
     }
+    return false; // caught up for this experiment
   }
 
   // ============================================================
