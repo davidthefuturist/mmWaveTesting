@@ -422,20 +422,24 @@
   // ============================================================
   // NOTES
   // ============================================================
+  let notePreviewFrozen = false;
+
   function noteTargetUnixSec() {
     const offsetMin = Number(document.getElementById('noteOffsetMin').value) || 0;
     return Math.floor(Date.now() / 1000) + Math.round(offsetMin * 60);
   }
 
   function updateNotePreview() {
+    if (notePreviewFrozen) return; // held on the just-submitted timestamp
     const offsetMin = Number(document.getElementById('noteOffsetMin').value) || 0;
     const target = new Date(noteTargetUnixSec() * 1000);
     let whenLabel;
     if (offsetMin === 0) whenLabel = 'now';
     else if (offsetMin < 0) whenLabel = `${Math.abs(offsetMin)} min ago`;
     else whenLabel = `${offsetMin} min from now`;
-    document.getElementById('notePreview').innerText =
-      `Timestamp: ${target.toLocaleTimeString()} (${whenLabel})`;
+    const el = document.getElementById('notePreview');
+    el.style.color = '#888';
+    el.innerText = `Timestamp: ${target.toLocaleTimeString()} (${whenLabel})`;
   }
   document.getElementById('noteOffsetMin').addEventListener('input', updateNotePreview);
   updateNotePreview();
@@ -444,6 +448,7 @@
   document.getElementById('addNoteBtn').addEventListener('click', async () => {
     const text = document.getElementById('noteText').value.trim();
     const statusEl = document.getElementById('noteStatus');
+    const previewEl = document.getElementById('notePreview');
     if (!currentExpId) {
       statusEl.style.color = '#e63946';
       statusEl.innerText = 'No experiment to attach this note to yet — connect / start one first.';
@@ -454,21 +459,52 @@
       statusEl.innerText = 'Note is empty.';
       return;
     }
+
+    // Freeze the displayed timestamp the instant the button is pressed,
+    // so what you see is exactly what gets sent -- not still ticking
+    // while the request is in flight.
     const targetTs = noteTargetUnixSec();
     const loggedAt = Math.floor(Date.now() / 1000);
+    const frozenLabel = new Date(targetTs * 1000).toLocaleTimeString();
+    notePreviewFrozen = true;
+    previewEl.style.color = '#888';
+    previewEl.innerText = `Timestamp: ${frozenLabel} (sending…)`;
+
+    const addBtn = document.getElementById('addNoteBtn');
+    addBtn.disabled = true;
+    statusEl.style.color = '#888';
+    statusEl.innerText = 'Sending…';
+
     const name = document.getElementById('expNameInput').value.trim();
     try {
       await postNoteToSheet(currentExpId, name, targetTs, text, loggedAt);
-      const when = new Date(targetTs * 1000).toLocaleTimeString();
-      logEvent(`Note added for ${currentExpId} @ ${when}: "${text}"`);
+      logEvent(`Note added for ${currentExpId} @ ${frozenLabel}: "${text}"`);
+      previewEl.style.color = '#2a9d5c';
+      previewEl.innerText = `Timestamp: ${frozenLabel} (saved ✓)`;
       statusEl.style.color = '#2a9d5c';
-      statusEl.innerText = 'Note added.';
+      statusEl.innerText = 'Note saved to Sheet.';
       document.getElementById('noteText').value = '';
       document.getElementById('noteOffsetMin').value = '0';
-      updateNotePreview();
+      // Hold the confirmation on screen briefly, then resume live "now".
+      setTimeout(() => {
+        notePreviewFrozen = false;
+        updateNotePreview();
+      }, 4000);
     } catch (e) {
+      // Genuine failure -- confirmed via a real (JSONP) response, not
+      // guessed. The note was NOT saved: text and offset are left
+      // exactly as typed so nothing is lost and you can just retry.
+      logEvent(`Note FAILED for ${currentExpId} @ ${frozenLabel}: ${e.message}`);
+      previewEl.style.color = '#e63946';
+      previewEl.innerText = `Timestamp: ${frozenLabel} (FAILED — not saved)`;
       statusEl.style.color = '#e63946';
-      statusEl.innerText = 'Failed to send note: ' + e.message;
+      statusEl.innerText = `Failed to save note: ${e.message}. Nothing was lost — tap Add Note to retry.`;
+      setTimeout(() => {
+        notePreviewFrozen = false;
+        updateNotePreview();
+      }, 4000);
+    } finally {
+      addBtn.disabled = false;
     }
   });
 
@@ -507,17 +543,31 @@
   }
 
   function postNoteToSheet(expId, name, timestamp, noteText, loggedAt) {
-    // Same fire-and-forget pattern -- notes are simple appends (never
-    // upserted/deduped), so there's no read-back needed like there is
-    // for sensor rows.
-    return fetch(APPS_SCRIPT_URL, {
-      method: 'POST',
-      mode: 'no-cors',
-      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
-      body: JSON.stringify({
-        type: 'note', exp_id: expId, name: name,
-        timestamp: timestamp, note: noteText, logged_at: loggedAt
-      })
+    // GET+JSONP, not POST -- this is the one place in the app where we
+    // actually need to know whether the write landed, since notes have
+    // no reconciliation/retry loop backing them up like sensor rows do.
+    return new Promise((resolve, reject) => {
+      const cbName = 'jsonp_note_' + Math.random().toString(36).slice(2);
+      const script = document.createElement('script');
+      const timeout = setTimeout(() => { cleanup(); reject(new Error('timeout')); }, 10000);
+      function cleanup() {
+        clearTimeout(timeout);
+        delete window[cbName];
+        if (script.parentNode) script.parentNode.removeChild(script);
+      }
+      window[cbName] = (data) => {
+        cleanup();
+        if (data && data.status === 'ok') resolve(data);
+        else reject(new Error((data && data.message) || 'unknown server error'));
+      };
+      script.onerror = () => { cleanup(); reject(new Error('load error')); };
+      const qs = new URLSearchParams({
+        exp: expId, action: 'addnote', name: name || '',
+        timestamp: String(timestamp), note: noteText, logged_at: String(loggedAt),
+        callback: cbName
+      });
+      script.src = `${APPS_SCRIPT_URL}?${qs.toString()}`;
+      document.body.appendChild(script);
     });
   }
 
