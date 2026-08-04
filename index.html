@@ -89,6 +89,27 @@
     </section>
 
     <section>
+      <h4>Notes</h4>
+      <label>Note</label>
+      <textarea id="noteText" rows="3" placeholder="e.g. moved sensor 1m closer to doorway"
+        style="width:100%; box-sizing:border-box; padding:12px; border-radius:6px; border:1px solid #ccc; font-size:15px; font-family:inherit; resize:vertical;"></textarea>
+      <div class="row-2" style="margin-top:10px;">
+        <div>
+          <label>Timestamp offset (minutes)</label>
+          <input type="text" inputmode="numeric" id="noteOffsetMin" value="0" placeholder="0 = now, -5 = 5 min ago, 5 = 5 min from now">
+        </div>
+        <div>
+          <label>Applies to</label>
+          <input type="text" id="noteTargetExpDisplay" value="none" disabled
+            style="width:100%; box-sizing:border-box; padding:12px; border-radius:6px; border:1px solid #ccc; background:#f4f4f4; color:#666; font-size:15px;">
+        </div>
+      </div>
+      <div style="font-size:11px; color:#888; margin-top:6px;" id="notePreview">Timestamp: --</div>
+      <button id="addNoteBtn" class="btn btn-primary">ADD NOTE</button>
+      <div id="noteStatus" style="font-size:12px; color:#888; margin-top:6px; min-height:14px;"></div>
+    </section>
+
+    <section>
       <h4>Sync to Google Sheet</h4>
       <div class="board">
         <div class="k">Synced this session</div><div class="v" id="syncedCount">0</div>
@@ -96,6 +117,7 @@
         <div class="k">Last sync pass</div><div class="v" id="lastSyncAt">never</div>
       </div>
     </section>
+
 
     <section>
       <h4>Activity Log</h4>
@@ -166,6 +188,8 @@
     document.getElementById('expIdDisplay').innerText = expActive ? currentExpId : 'none';
     document.getElementById('startBlock').style.display = expActive ? 'none' : 'block';
     document.getElementById('stopBtn').style.display = expActive ? 'block' : 'none';
+    document.getElementById('noteTargetExpDisplay').value = currentExpId || 'none';
+    document.getElementById('addNoteBtn').disabled = !currentExpId;
   }
 
   // ============================================================
@@ -396,6 +420,59 @@
   });
 
   // ============================================================
+  // NOTES
+  // ============================================================
+  function noteTargetUnixSec() {
+    const offsetMin = Number(document.getElementById('noteOffsetMin').value) || 0;
+    return Math.floor(Date.now() / 1000) + Math.round(offsetMin * 60);
+  }
+
+  function updateNotePreview() {
+    const offsetMin = Number(document.getElementById('noteOffsetMin').value) || 0;
+    const target = new Date(noteTargetUnixSec() * 1000);
+    let whenLabel;
+    if (offsetMin === 0) whenLabel = 'now';
+    else if (offsetMin < 0) whenLabel = `${Math.abs(offsetMin)} min ago`;
+    else whenLabel = `${offsetMin} min from now`;
+    document.getElementById('notePreview').innerText =
+      `Timestamp: ${target.toLocaleTimeString()} (${whenLabel})`;
+  }
+  document.getElementById('noteOffsetMin').addEventListener('input', updateNotePreview);
+  updateNotePreview();
+  setInterval(updateNotePreview, 1000); // keep "now" fresh even if untouched
+
+  document.getElementById('addNoteBtn').addEventListener('click', async () => {
+    const text = document.getElementById('noteText').value.trim();
+    const statusEl = document.getElementById('noteStatus');
+    if (!currentExpId) {
+      statusEl.style.color = '#e63946';
+      statusEl.innerText = 'No experiment to attach this note to yet — connect / start one first.';
+      return;
+    }
+    if (!text) {
+      statusEl.style.color = '#e63946';
+      statusEl.innerText = 'Note is empty.';
+      return;
+    }
+    const targetTs = noteTargetUnixSec();
+    const loggedAt = Math.floor(Date.now() / 1000);
+    const name = document.getElementById('expNameInput').value.trim();
+    try {
+      await postNoteToSheet(currentExpId, name, targetTs, text, loggedAt);
+      const when = new Date(targetTs * 1000).toLocaleTimeString();
+      logEvent(`Note added for ${currentExpId} @ ${when}: "${text}"`);
+      statusEl.style.color = '#2a9d5c';
+      statusEl.innerText = 'Note added.';
+      document.getElementById('noteText').value = '';
+      document.getElementById('noteOffsetMin').value = '0';
+      updateNotePreview();
+    } catch (e) {
+      statusEl.style.color = '#e63946';
+      statusEl.innerText = 'Failed to send note: ' + e.message;
+    }
+  });
+
+  // ============================================================
   // JSONP fetch from Apps Script (fetch()/CORS is unreliable on
   // script.google.com, so we load the response as a <script> tag instead)
   // ============================================================
@@ -426,6 +503,21 @@
       mode: 'no-cors',
       headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
       body: JSON.stringify({ exp_id: expId, name: name, rows: rows })
+    });
+  }
+
+  function postNoteToSheet(expId, name, timestamp, noteText, loggedAt) {
+    // Same fire-and-forget pattern -- notes are simple appends (never
+    // upserted/deduped), so there's no read-back needed like there is
+    // for sensor rows.
+    return fetch(APPS_SCRIPT_URL, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+      body: JSON.stringify({
+        type: 'note', exp_id: expId, name: name,
+        timestamp: timestamp, note: noteText, logged_at: loggedAt
+      })
     });
   }
 
@@ -548,6 +640,7 @@
   // ============================================================
   // INIT — restore any state that survives a page refresh
   // ============================================================
+  refreshExperimentUI();
   if (stopRequestedWhileDisconnected) {
     setStatusLine('A Stop was requested before this page reloaded — reconnect to send it', 'warn');
   }
